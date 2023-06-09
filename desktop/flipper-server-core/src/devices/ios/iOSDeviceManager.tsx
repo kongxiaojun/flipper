@@ -23,6 +23,7 @@ import {
 import {FlipperServerImpl} from '../../FlipperServerImpl';
 import {getFlipperServerConfig} from '../../FlipperServerConfig';
 import iOSCertificateProvider from './iOSCertificateProvider';
+import exitHook from 'exit-hook';
 
 export class IOSDeviceManager {
   private portForwarders: Array<ChildProcess> = [];
@@ -73,6 +74,11 @@ export class IOSDeviceManager {
         console.log(`[conn] Port forwarding app exited gracefully`);
       }
     });
+
+    exitHook(() => {
+      child.kill('SIGKILL');
+    });
+
     return child;
   }
 
@@ -98,17 +104,12 @@ export class IOSDeviceManager {
   }
 
   private processDevices(bridge: IOSBridge, activeDevices: IOSDeviceParams[]) {
-    console.debug('[conn] processDevices', activeDevices);
     const currentDeviceIDs = new Set(
       this.flipperServer
         .getDevices()
         .filter((device) => device.info.os === 'iOS')
         .filter((device) => device.info.deviceType !== 'dummy')
         .map((device) => device.serial),
-    );
-    console.debug(
-      '[conn] processDevices -> currentDeviceIDs',
-      currentDeviceIDs,
     );
 
     for (const activeDevice of activeDevices) {
@@ -220,7 +221,8 @@ export class IOSDeviceManager {
         description: errorMessage,
       });
     } catch (e) {
-      console.error('Failed to determine Xcode version:', e);
+      // This is not an error. It depends on the user's local setup that we cannot influence.
+      console.warn('Failed to determine Xcode version:', e);
     }
   }
 }

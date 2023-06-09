@@ -20,6 +20,7 @@ module.exports = {
     '^flipper-(server-core|ui-core|frontend-core|common)$':
       '<rootDir>/flipper-$1/src',
     '^flipper-(pkg|pkg-lib|doctor|test-utils)$': '<rootDir>/$1/src',
+    '^.+\\.(css|scss)$': '<rootDir>/scripts/jest-css-stub.js',
   },
   clearMocks: true,
   coverageReporters: [
@@ -29,6 +30,6 @@ module.exports = {
     ...(process.env.COVERAGE_TEXT === 'detailed' ? ['text'] : []),
   ],
   testMatch: ['**/**.(node|spec).(js|jsx|ts|tsx)'],
-  testEnvironment: 'jest-environment-jsdom-sixteen',
+  testEnvironment: 'jsdom',
   resolver: '<rootDir>/jest.resolver.js',
 };

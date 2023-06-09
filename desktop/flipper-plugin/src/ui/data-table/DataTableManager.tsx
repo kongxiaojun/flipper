@@ -9,7 +9,7 @@
 
 import type {DataTableColumn} from './DataTable';
 import {Percentage} from '../../utils/widthUtils';
-import {MutableRefObject, Reducer} from 'react';
+import {MutableRefObject, Reducer, RefObject} from 'react';
 import {DataSourceVirtualizer} from '../../data-source/index';
 import produce, {castDraft, immerable, original} from 'immer';
 import {theme} from '../theme';
@@ -56,6 +56,16 @@ type PersistedState = {
   highlightSearchSetting: SearchHighlightSetting;
 };
 
+type AddColumnFilterOptions = {
+  /**
+   * The filter is strict by default
+   * All entries that are missing this value(undefined) will be filtered out.
+   * By disabling this option you make filter include rows that don't have this value ie undefined
+   */
+  strict?: boolean;
+  disableOthers?: boolean;
+};
+
 type Action<Name extends string, Args = {}> = {type: Name} & Args;
 
 type DataManagerActions<T> =
@@ -97,10 +107,18 @@ type DataManagerActions<T> =
   /** Changing column filters */
   | Action<
       'addColumnFilter',
-      {column: keyof T; value: string; disableOthers?: boolean}
+      {column: keyof T; value: string; options: AddColumnFilterOptions}
     >
-  | Action<'removeColumnFilter', {column: keyof T; index: number}>
-  | Action<'toggleColumnFilter', {column: keyof T; index: number}>
+  | Action<
+      'removeColumnFilter',
+      | {column: keyof T; index: number; label?: never}
+      | {column: keyof T; index?: never; label: string}
+    >
+  | Action<
+      'toggleColumnFilter',
+      | {column: keyof T; index: number; label?: never}
+      | {column: keyof T; index?: never; label: string}
+    >
   | Action<'setColumnFilterInverse', {column: keyof T; inversed: boolean}>
   | Action<'setColumnFilterFromSelection', {column: keyof T}>
   | Action<'appliedInitialScroll'>
@@ -272,20 +290,33 @@ export const dataTableManagerReducer = produce<
         draft.columns,
         action.column,
         action.value,
-        action.disableOthers,
+        action.options,
       );
       break;
     }
     case 'removeColumnFilter': {
-      draft.columns
-        .find((c) => c.key === action.column)!
-        .filters?.splice(action.index, 1);
+      const column = draft.columns.find((c) => c.key === action.column)!;
+      const index =
+        action.index ??
+        column.filters?.findIndex((f) => f.label === action.label!);
+
+      if (index === undefined || index < 0) {
+        break;
+      }
+
+      column.filters?.splice(index, 1);
       break;
     }
     case 'toggleColumnFilter': {
-      const f = draft.columns.find((c) => c.key === action.column)!.filters![
-        action.index
-      ];
+      const column = draft.columns.find((c) => c.key === action.column)!;
+      const index =
+        action.index ??
+        column.filters?.findIndex((f) => f.label === action.label!);
+
+      if (index === undefined || index < 0) {
+        break;
+      }
+      const f = column.filters![index];
       f.enabled = !f.enabled;
       break;
     }
@@ -304,7 +335,9 @@ export const dataTableManagerReducer = produce<
           draft.columns,
           action.column,
           getValueAtPath(item, String(action.column)),
-          index === 0, // remove existing filters before adding the first
+          {
+            disableOthers: index === 0, // remove existing filters before adding the first
+          },
         );
       });
       break;
@@ -374,12 +407,19 @@ export type DataTableManager<T> = {
   sortColumn(column: keyof T, direction?: SortDirection): void;
   setSearchValue(value: string, addToHistory?: boolean): void;
   dataView: _DataSourceView<T, T[keyof T]>;
+  stateRef: RefObject<Readonly<DataManagerState<T>>>;
   toggleSearchValue(): void;
   toggleHighlightSearch(): void;
   setSearchHighlightColor(color: string): void;
   toggleSideBySide(): void;
   showSearchDropdown(show: boolean): void;
   setShowNumberedHistory(showNumberedHistory: boolean): void;
+  addColumnFilter(
+    column: keyof T,
+    value: string,
+    options?: AddColumnFilterOptions,
+  ): void;
+  removeColumnFilter(column: keyof T, label: string): void;
 };
 
 export function createDataTableManager<T>(
@@ -444,7 +484,14 @@ export function createDataTableManager<T>(
     setShowNumberedHistory(showNumberedHistory) {
       dispatch({type: 'setShowNumberedHistory', showNumberedHistory});
     },
+    addColumnFilter(column, value, options = {}) {
+      dispatch({type: 'addColumnFilter', column, value, options});
+    },
+    removeColumnFilter(column, label) {
+      dispatch({type: 'removeColumnFilter', column, label});
+    },
     dataView,
+    stateRef,
   };
 }
 
@@ -508,8 +555,9 @@ function addColumnFilter<T>(
   columns: DataTableColumn<T>[],
   columnId: keyof T,
   value: string,
-  disableOthers: boolean = false,
+  options: AddColumnFilterOptions = {},
 ): void {
+  options = Object.assign({disableOthers: false, strict: true}, options);
   const column = columns.find((c) => c.key === columnId)!;
   const filterValue = String(value).toLowerCase();
   const existing = column.filters!.find((c) => c.value === filterValue);
@@ -520,9 +568,10 @@ function addColumnFilter<T>(
       label: String(value),
       value: filterValue,
       enabled: true,
+      strict: options.strict,
     });
   }
-  if (disableOthers) {
+  if (options.disableOthers) {
     column.filters!.forEach((c) => {
       if (c.value !== filterValue) {
         c.enabled = false;
@@ -664,13 +713,16 @@ export function computeDataTableFilter(
 
   return function dataTableFilter(item: any) {
     for (const column of filteringColumns) {
-      const rowMatchesFilter = column.filters!.some(
-        (f) =>
-          f.enabled &&
-          String(getValueAtPath(item, column.key))
-            .toLowerCase()
-            .includes(f.value),
-      );
+      const rowMatchesFilter = column.filters!.some((f) => {
+        if (!f.enabled) {
+          return false;
+        }
+
+        const value = getValueAtPath(item, column.key);
+        const isMatching = String(value).toLowerCase().includes(f.value);
+
+        return f.strict ? isMatching : isMatching || value === undefined;
+      });
       if (column.inversed && rowMatchesFilter) {
         return false;
       }

@@ -7,25 +7,23 @@
  * @format
  */
 
-import React, {useEffect, useMemo, useRef, useState} from 'react';
-import {Bounds, Coordinate, Id, NestedNode, Tag, UINode} from '../types';
+import React, {useEffect, useMemo, useRef} from 'react';
+import {Bounds, Coordinate, Id, NestedNode, UINode} from '../types';
 
 import {produce, styled, theme, usePlugin, useValue} from 'flipper-plugin';
 import {plugin} from '../index';
 import {head, isEqual, throttle} from 'lodash';
 import {Dropdown, Menu, Tooltip} from 'antd';
 import {UIDebuggerMenuItem} from './util/UIDebuggerMenuItem';
+import {useDelay} from '../hooks/useDelay';
 
 export const Visualization2D: React.FC<
   {
-    rootId: Id;
     width: number;
     nodes: Map<Id, UINode>;
-    selectedNode?: Id;
     onSelectNode: (id?: Id) => void;
-    modifierPressed: boolean;
   } & React.HTMLAttributes<HTMLDivElement>
-> = ({rootId, width, nodes, selectedNode, onSelectNode, modifierPressed}) => {
+> = ({width, nodes, onSelectNode}) => {
   const rootNodeRef = useRef<HTMLDivElement>();
   const instance = usePlugin(plugin);
 
@@ -33,10 +31,13 @@ export const Visualization2D: React.FC<
   const snapshotNode = snapshot && nodes.get(snapshot.nodeId);
   const focusedNodeId = useValue(instance.uiState.focusedNode);
 
+  const selectedNodeId = useValue(instance.uiState.selectedNode);
+  const hoveredNodeId = head(useValue(instance.uiState.hoveredNodes));
   const focusState = useMemo(() => {
-    const rootNode = toNestedNode(rootId, nodes);
+    //use the snapshot node as root since we cant realistically visualise any node above this
+    const rootNode = snapshot && toNestedNode(snapshot.nodeId, nodes);
     return rootNode && caclulateFocusState(rootNode, focusedNodeId);
-  }, [focusedNodeId, rootId, nodes]);
+  }, [snapshot, nodes, focusedNodeId]);
 
   useEffect(() => {
     const mouseListener = throttle((ev: MouseEvent) => {
@@ -100,6 +101,13 @@ export const Visualization2D: React.FC<
   return (
     <ContextMenu nodes={nodes}>
       <div
+        onMouseLeave={(e) => {
+          e.stopPropagation();
+          //the context menu triggers this callback but we dont want to remove hover effect
+          if (!instance.uiState.isContextMenuOpen.get()) {
+            instance.uiState.hoveredNodes.set([]);
+          }
+        }}
         //this div is to ensure that the size of the visualiser doesnt change when focusings on a subtree
         style={
           {
@@ -108,15 +116,22 @@ export const Visualization2D: React.FC<
             height: toPx(focusState.actualRoot.bounds.height),
           } as React.CSSProperties
         }>
+        {hoveredNodeId && (
+          <HoveredOverlay
+            key={hoveredNodeId}
+            nodeId={hoveredNodeId}
+            nodes={nodes}
+          />
+        )}
+        {selectedNodeId && (
+          <OverlayBorder
+            type="selected"
+            nodeId={selectedNodeId}
+            nodes={nodes}
+          />
+        )}
         <div
           ref={rootNodeRef as any}
-          onMouseLeave={(e) => {
-            e.stopPropagation();
-            //the context menu triggers this callback but we dont want to remove hover effect
-            if (!instance.uiState.isContextMenuOpen.get()) {
-              instance.uiState.hoveredNodes.set([]);
-            }
-          }}
           style={{
             /**
              * This relative position is so the rootNode visualization 2DNode and outer border has a non static element to
@@ -136,7 +151,7 @@ export const Visualization2D: React.FC<
           }}>
           {snapshotNode && (
             <img
-              src={'data:image/png;base64,' + snapshot.base64Image}
+              src={'data:image/png;base64,' + snapshot.data}
               style={{
                 marginLeft: toPx(-focusState.focusedRootGlobalOffset.x),
                 marginTop: toPx(-focusState.focusedRootGlobalOffset.y),
@@ -147,9 +162,7 @@ export const Visualization2D: React.FC<
           )}
           <MemoedVisualizationNode2D
             node={focusState.focusedRoot}
-            selectedNode={selectedNode}
             onSelectNode={onSelectNode}
-            modifierPressed={modifierPressed}
           />
         </div>
       </div>
@@ -160,30 +173,20 @@ export const Visualization2D: React.FC<
 const MemoedVisualizationNode2D = React.memo(
   Visualization2DNode,
   (prev, next) => {
-    return (
-      prev.node === next.node &&
-      prev.modifierPressed === next.modifierPressed &&
-      prev.selectedNode === next.selectedNode
-    );
+    return prev.node === next.node;
   },
 );
 
 function Visualization2DNode({
   node,
-  selectedNode,
   onSelectNode,
-  modifierPressed,
 }: {
   node: NestedNode;
-  modifierPressed: boolean;
-  selectedNode?: Id;
   onSelectNode: (id?: Id) => void;
 }) {
   const instance = usePlugin(plugin);
 
-  const isSelected = selectedNode === node.id;
-  const {isHovered, isLongHovered} = useHoverStates(node.id);
-
+  const ref = useRef<HTMLDivElement>(null);
   let nestedChildren: NestedNode[];
 
   //if there is an active child don't draw the other children
@@ -194,99 +197,111 @@ function Visualization2DNode({
     nestedChildren = node.children;
   }
 
-  // stop drawing children if hovered with the modifier so you
-  // can see parent views without their children getting in the way
-  if (isHovered && modifierPressed) {
-    nestedChildren = [];
-  }
-
   const children = nestedChildren.map((child) => (
     <MemoedVisualizationNode2D
       key={child.id}
       node={child}
       onSelectNode={onSelectNode}
-      selectedNode={selectedNode}
-      modifierPressed={modifierPressed}
     />
   ));
 
+  const isHighlighted = useValue(instance.uiState.highlightedNodes).has(
+    node.id,
+  );
+
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      ref={ref}
+      style={{
+        position: 'absolute',
+        cursor: 'pointer',
+        left: toPx(node.bounds.x),
+        top: toPx(node.bounds.y),
+        width: toPx(node.bounds.width),
+        height: toPx(node.bounds.height),
+        opacity: isHighlighted ? 0.3 : 1,
+        backgroundColor: isHighlighted ? 'red' : 'transparent',
+      }}
+      onClick={(e) => {
+        e.stopPropagation();
+
+        const hoveredNodes = instance.uiState.hoveredNodes.get();
+
+        onSelectNode(hoveredNodes[0]);
+      }}>
+      <NodeBorder />
+
+      {children}
+    </div>
+  );
+}
+
+function HoveredOverlay({nodeId, nodes}: {nodeId: Id; nodes: Map<Id, UINode>}) {
+  const node = nodes.get(nodeId);
+
+  const isVisible = useDelay(longHoverDelay);
+
   return (
     <Tooltip
-      visible={isLongHovered}
+      visible={isVisible}
+      key={nodeId}
       placement="top"
       zIndex={100}
       trigger={[]}
-      title={node.name}
+      title={node?.name}
       align={{
         offset: [0, 7],
       }}>
-      <div
-        role="button"
-        tabIndex={0}
-        style={{
-          position: 'absolute',
-          cursor: 'pointer',
-          left: toPx(node.bounds.x),
-          top: toPx(node.bounds.y),
-          width: toPx(node.bounds.width),
-          height: toPx(node.bounds.height),
-          opacity: isSelected ? 0.5 : 1,
-          backgroundColor: isSelected
-            ? theme.selectionBackgroundColor
-            : 'transparent',
-        }}
-        onClick={(e) => {
-          e.stopPropagation();
-
-          const hoveredNodes = instance.uiState.hoveredNodes.get();
-          if (hoveredNodes[0] === selectedNode) {
-            onSelectNode(undefined);
-          } else {
-            onSelectNode(hoveredNodes[0]);
-          }
-        }}>
-        <NodeBorder hovered={isHovered} tags={node.tags}></NodeBorder>
-        {children}
-      </div>
+      <OverlayBorder nodeId={nodeId} nodes={nodes} type="hovered" />
     </Tooltip>
   );
 }
 
-function useHoverStates(nodeId: Id) {
-  const instance = usePlugin(plugin);
-  const [isHovered, setIsHovered] = useState(false);
-  const [isLongHovered, setIsLongHovered] = useState(false);
-  useEffect(() => {
-    const listener = (newValue?: Id[], prevValue?: Id[]) => {
-      //only change state if the prev or next hover state affect us, this avoids rerendering the whole tree for a hover
-      //change
-      if (head(prevValue) === nodeId || head(newValue) === nodeId) {
-        const hovered = head(newValue) === nodeId;
-        setIsHovered(hovered);
-
-        if (hovered === true) {
-          setTimeout(() => {
-            const isStillHovered =
-              head(instance.uiState.hoveredNodes.get()) === nodeId;
-            if (isStillHovered) {
-              setIsLongHovered(true);
-            }
-          }, longHoverDelay);
-        } else {
-          setIsLongHovered(false);
-        }
-      }
-    };
-    instance.uiState.hoveredNodes.subscribe(listener);
-    return () => {
-      instance.uiState.hoveredNodes.unsubscribe(listener);
-    };
-  }, [instance.uiState.hoveredNodes, nodeId]);
-
+const OverlayBorder = styled.div<{
+  type: 'selected' | 'hovered';
+  nodeId: Id;
+  nodes: Map<Id, UINode>;
+}>(({type, nodeId, nodes}) => {
+  const offset = getTotalOffset(nodeId, nodes);
+  const node = nodes.get(nodeId);
   return {
-    isHovered,
-    isLongHovered,
+    zIndex: 100,
+    pointerEvents: 'none',
+    cursor: 'pointer',
+    position: 'absolute',
+    top: toPx(offset.y),
+    left: toPx(offset.x),
+    width: toPx(node?.bounds?.width ?? 0),
+    height: toPx(node?.bounds?.height ?? 0),
+    boxSizing: 'border-box',
+    borderWidth: 2,
+    borderStyle: 'solid',
+    color: 'transparent',
+    borderColor:
+      type === 'selected' ? theme.primaryColor : theme.textColorPlaceholder,
   };
+});
+
+/**
+ * computes the x,y offset of a given node from the root of the visualization
+ * in node coordinates
+ */
+function getTotalOffset(id: Id, nodes: Map<Id, UINode>): Coordinate {
+  const offset = {x: 0, y: 0};
+  let curId: Id | undefined = id;
+
+  while (curId != null) {
+    const cur = nodes.get(curId);
+    if (cur != null) {
+      offset.x += cur.bounds.x;
+      offset.y += cur.bounds.y;
+    }
+    curId = cur?.parent;
+  }
+
+  return offset;
 }
 
 const ContextMenu: React.FC<{nodes: Map<Id, UINode>}> = ({children}) => {
@@ -311,7 +326,7 @@ const ContextMenu: React.FC<{nodes: Map<Id, UINode>}> = ({children}) => {
                 key="focus"
                 text={`Focus ${hoveredNode?.name}`}
                 onClick={() => {
-                  instance.uiState.focusedNode.set(hoveredNode?.id);
+                  instance.uiActions.onFocusNode(hoveredNode?.id);
                 }}
               />
             )}
@@ -337,45 +352,25 @@ const ContextMenu: React.FC<{nodes: Map<Id, UINode>}> = ({children}) => {
  * node itself so that it has the same size but the border doesnt affect the sizing of its children
  * as border is part of the box model
  */
-const NodeBorder = styled.div<{tags: Tag[]; hovered: boolean}>((props) => ({
+const NodeBorder = styled.div({
   position: 'absolute',
   top: 0,
   left: 0,
   bottom: 0,
   right: 0,
-  borderWidth: props.hovered ? '2px' : '1px',
+  boxSizing: 'border-box',
+  borderWidth: '1px',
   borderStyle: 'solid',
   color: 'transparent',
-  borderColor: props.tags.includes('Declarative')
-    ? 'green'
-    : props.tags.includes('Native')
-    ? 'blue'
-    : 'black',
-}));
+  borderColor: theme.disabledColor,
+});
 
-const longHoverDelay = 200;
-const outerBorderWidth = '10px';
-const outerBorderOffset = `-${outerBorderWidth}`;
+const longHoverDelay = 500;
 const pxScaleFactorCssVar = '--pxScaleFactor';
 const MouseThrottle = 32;
 
-//this is the thick black border around the whole vizualization, the border goes around the content
-//hence the top,left,right,botton being negative to increase its size
-const OuterBorder = styled.div({
-  boxSizing: 'border-box',
-  position: 'absolute',
-  top: outerBorderOffset,
-  left: outerBorderOffset,
-  right: outerBorderOffset,
-  bottom: outerBorderOffset,
-  borderWidth: outerBorderWidth,
-  borderStyle: 'solid',
-  borderColor: 'black',
-  borderRadius: '10px',
-});
-
 function toPx(n: number) {
-  return `calc(${n}px / var(${pxScaleFactorCssVar})`;
+  return `calc(${n}px / var(${pxScaleFactorCssVar}))`;
 }
 
 function toNestedNode(
@@ -383,18 +378,32 @@ function toNestedNode(
   nodes: Map<Id, UINode>,
 ): NestedNode | undefined {
   function uiNodeToNestedNode(node: UINode): NestedNode {
+    const nonNullChildren = node.children.filter(
+      (childId) => nodes.get(childId) != null,
+    );
+
+    if (nonNullChildren.length !== node.children.length) {
+      console.error(
+        'Visualization2D.toNestedNode -> child is nullish!',
+        node.children,
+        nonNullChildren.map((childId) => {
+          const child = nodes.get(childId);
+          return child && uiNodeToNestedNode(child);
+        }),
+      );
+    }
+
     const activeChildIdx = node.activeChild
-      ? node.children.indexOf(node.activeChild)
+      ? nonNullChildren.indexOf(node.activeChild)
       : undefined;
 
     return {
       id: node.id,
       name: node.name,
       attributes: node.attributes,
-      children: node.children
-        .map((childId) => nodes.get(childId))
-        .filter((child) => child != null)
-        .map((child) => uiNodeToNestedNode(child!!)),
+      children: nonNullChildren.map((childId) =>
+        uiNodeToNestedNode(nodes.get(childId)!),
+      ),
       bounds: node.bounds,
       tags: node.tags,
       activeChildIdx: activeChildIdx,

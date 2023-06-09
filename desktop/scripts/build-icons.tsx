@@ -13,6 +13,8 @@ import fetch from '@adobe/node-fetch-retry';
 // eslint-disable-next-line node/no-extraneous-import
 import type {Icon} from 'flipper-ui-core';
 
+const AVAILABLE_SIZES: Icon['size'][] = [8, 10, 12, 16, 18, 20, 24, 28, 32];
+
 export type Icons = {
   [key: string]: Icon['size'][];
 };
@@ -48,45 +50,53 @@ export async function downloadIcons(buildFolder: string) {
     [],
   );
 
-  return Promise.all(
-    iconURLs.map((icon) => {
-      const url = getPublicIconUrl(icon);
-      return fetch(url, {
-        retryOptions: {
-          retryMaxDuration: 120 * 1000,
-          // Be default, only 5xx are retried but we're getting the odd 404
-          // which goes away on a retry for some reason.
-          retryOnHttpResponse: (res) => res.status >= 400,
-          retryOnHttpError: () => true,
-        },
-      })
-        .then((res) => {
-          if (res.status !== 200) {
-            throw new Error(
-              // eslint-disable-next-line prettier/prettier
-              `Could not download the icon ${icon} from ${url}: got status ${res.status}`,
-            );
-          }
-          return res;
-        })
-        .then(
-          (res) =>
-            new Promise((resolve, reject) => {
-              const fileStream = fs.createWriteStream(
-                path.join(buildFolder, buildLocalIconPath(icon)),
-              );
-              res.body.pipe(fileStream);
-              res.body.on('error', reject);
-              fileStream.on('finish', resolve);
-            }),
-        );
+  await Promise.all(
+    iconURLs.map(async (icon) => {
+      const sizeIndex = AVAILABLE_SIZES.indexOf(icon.size);
+      if (sizeIndex === -1) {
+        throw new Error('Size unavailable: ' + icon.size);
+      }
+      const sizesToTry = AVAILABLE_SIZES.slice(sizeIndex);
+
+      while (sizesToTry.length) {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+        const size = sizesToTry.shift()!;
+
+        const url = getPublicIconUrl({...icon, size});
+        const res = await fetch(url);
+        if (res.status !== 200) {
+          // console.log(
+          //   // eslint-disable-next-line prettier/prettier
+          //   `Could not download the icon ${
+          //     icon.name
+          //   } at size ${size} from ${url}: got status ${
+          //     res.status
+          //   }. Will fallback to one of the sizes: ${sizesToTry.join(' or ')}`,
+          // );
+          // not available at this size, pick the next
+          continue;
+        }
+        return new Promise((resolve, reject) => {
+          const fileStream = fs.createWriteStream(
+            path.join(buildFolder, buildLocalIconPath(icon)),
+          );
+          res.body.pipe(fileStream);
+          res.body.on('error', reject);
+          fileStream.on('finish', resolve);
+        });
+      }
+      console.error(
+        `Could not download the icon ${JSON.stringify(
+          icon,
+        )} from ${getPublicIconUrl(icon)}, didn't find any matching size`,
+      );
     }),
   );
 }
 
 // should match flipper-ui-core/src/utils/icons.tsx
 export function getPublicIconUrl({name, variant, size, density}: Icon) {
-  return `https://facebook.com/assets/?name=${name}&variant=${variant}&size=${size}&set=facebook_icons&density=${density}x`;
+  return `https://facebook.com/images/assets_DO_NOT_HARDCODE/facebook_icons/${name}_${variant}_${size}.png`;
 }
 
 // should match app/src/utils/icons.tsx

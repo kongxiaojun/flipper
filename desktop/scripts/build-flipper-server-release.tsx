@@ -9,6 +9,9 @@
 
 const dotenv = require('dotenv').config();
 import path from 'path';
+import https from 'https';
+import os from 'os';
+import tar from 'tar';
 import {
   buildBrowserBundle,
   buildFolder,
@@ -35,12 +38,22 @@ import {need as pkgFetch} from 'pkg-fetch';
 
 // This needs to be tested individually. As of 2022Q2, node17 is not supported.
 const SUPPORTED_NODE_PLATFORM = 'node16';
+// Node version below is only used for macOS AARCH64 builds as we download
+// the binary directly from Node distribution site instead of relying on pkg-fetch.
+const NODE_VERSION = 'v16.15.0';
 
 enum BuildPlatform {
   LINUX = 'linux',
   WINDOWS = 'windows',
   MAC_X64 = 'mac-x64',
+  MAC_AARCH64 = 'mac-aarch64',
 }
+
+const LINUX_STARTUP_SCRIPT = `#!/bin/sh
+THIS_DIR="$( cd "$( dirname "\${BASH_SOURCE[0]}" )" && pwd )"
+cd "$THIS_DIR"
+./node ./server "$@"
+`;
 
 const argv = yargs
   .usage('yarn build-flipper-server [args]')
@@ -218,6 +231,8 @@ async function copyStaticResources(outDir: string, versionNumber: string) {
     'icons.json',
     'index.web.dev.html',
     'index.web.html',
+    'offline.html',
+    'service-worker.js',
     'style.css',
   ];
   if (isFB) {
@@ -229,6 +244,13 @@ async function copyStaticResources(outDir: string, versionNumber: string) {
       fs.copy(path.join(staticDir, e), path.join(outDir, 'static', e)),
     ),
   );
+
+  // Manifest needs to be copied over to static folder with the correct name.
+  await fs.copy(
+    path.join(staticDir, 'manifest.template.json'),
+    path.join(outDir, 'static', 'manifest.json'),
+  );
+
   console.log('✅  Copied static resources.');
 }
 
@@ -242,6 +264,7 @@ async function linkLocalDeps(buildFolder: string) {
     'flipper-common': `file:${rootDir}/flipper-common`,
     'flipper-frontend-core': `file:${rootDir}/flipper-frontend-core`,
     'flipper-plugin-core': `file:${rootDir}/flipper-plugin-core`,
+    'flipper-server-client': `file:${rootDir}/flipper-server-client`,
     'flipper-server-companion': `file:${rootDir}/flipper-server-companion`,
     'flipper-server-core': `file:${rootDir}/flipper-server-core`,
     'flipper-pkg-lib': `file:${rootDir}/pkg-lib`,
@@ -424,22 +447,87 @@ async function buildServerRelease() {
   if (argv.linux) {
     platforms.push(BuildPlatform.LINUX);
   }
-  // TODO: In the future, also cover aarch64 here.
   if (argv.mac) {
     platforms.push(BuildPlatform.MAC_X64);
+    platforms.push(BuildPlatform.MAC_AARCH64);
   }
   if (argv.win) {
     platforms.push(BuildPlatform.WINDOWS);
   }
 
-  platforms.forEach(
-    bundleServerReleaseForPlatform.bind(null, dir, versionNumber),
-  );
+  for (const platform of platforms) {
+    await bundleServerReleaseForPlatform(dir, versionNumber, platform);
+  }
 }
 
-function nodeArchFromBuildPlatform(_platform: BuildPlatform): string {
-  // TODO: Change this as we support aarch64.
+function nodeArchFromBuildPlatform(platform: BuildPlatform): string {
+  if (platform === BuildPlatform.MAC_AARCH64) {
+    return 'arm64';
+  }
   return 'x64';
+}
+
+/**
+ * Downloads a file located at the given URL and saves it to the destination path..
+ * @param url - URL of the file to download.
+ * @param dest - Destination path for the downloaded file.
+ * @returns - A promise that resolves when the file is downloaded.
+ * If the file can't be downloaded, it rejects with an error.
+ */
+async function download(url: string, dest: string): Promise<void> {
+  // First, check if the file already exists and remove it.
+  try {
+    await fs.access(dest, fs.constants.F_OK);
+    await fs.unlink(dest);
+  } catch (err) {}
+
+  return new Promise<void>((resolve, reject) => {
+    // Then, download the file and save it to the destination path.
+    const file: fs.WriteStream = fs.createWriteStream(dest);
+    https
+      .get(url, (response) => {
+        response.pipe(file);
+        file.on('finish', () => {
+          file.close();
+          console.log(`✅  Download successful ${url}.`);
+          resolve();
+        });
+      })
+      .on('error', (error: Error) => {
+        fs.unlink(dest);
+        reject(error);
+      });
+  });
+}
+
+/**
+ * Unpacks a tarball and extracts the contents to a directory.
+ * @param source - Source tarball.
+ * @param dest - Destination directory for the extracted contents.
+ */
+async function unpack(source: string, destination: string) {
+  console.log(`⚙️  Extracting ${source}.`);
+
+  try {
+    await fs.access(destination, fs.constants.F_OK);
+    await fs.rm(destination, {recursive: true, force: true});
+  } catch (err) {}
+
+  await fs.mkdir(destination);
+
+  try {
+    await tar.x({
+      file: source,
+      strip: 1,
+      cwd: destination,
+    });
+
+    console.log(`✅  Extraction completed.`);
+  } catch (error) {
+    console.error(
+      `⚙️  Error found whilst trying to extract '${source}'. Found: ${error}`,
+    );
+  }
 }
 
 function nodePlatformFromBuildPlatform(platform: BuildPlatform): string {
@@ -447,6 +535,7 @@ function nodePlatformFromBuildPlatform(platform: BuildPlatform): string {
     case BuildPlatform.LINUX:
       return 'linux';
     case BuildPlatform.MAC_X64:
+    case BuildPlatform.MAC_AARCH64:
       return 'macos';
     case BuildPlatform.WINDOWS:
       return 'win32';
@@ -456,14 +545,68 @@ function nodePlatformFromBuildPlatform(platform: BuildPlatform): string {
 }
 
 async function installNodeBinary(outputPath: string, platform: BuildPlatform) {
-  const path = await pkgFetch({
-    arch: nodeArchFromBuildPlatform(platform),
-    platform: nodePlatformFromBuildPlatform(platform),
-    nodeRange: SUPPORTED_NODE_PLATFORM,
-  });
-  await fs.copyFile(path, outputPath);
+  /**
+   * Below is a temporary patch that doesn't use pkg-fetch to
+   * download a node binary for macOS arm64.
+   * This will be removed once there's a properly
+   * signed binary for macOS arm64 architecture.
+   */
+  if (platform === BuildPlatform.MAC_AARCH64) {
+    const temporaryDirectory = os.tmpdir();
+    const name = `node-${NODE_VERSION}-darwin-arm64`;
+    const downloadOutputPath = path.resolve(
+      temporaryDirectory,
+      `${name}.tar.gz`,
+    );
+    const unpackedOutputPath = path.resolve(temporaryDirectory, name);
+    let nodePath = path.resolve(unpackedOutputPath, 'bin', 'node');
+    console.log(
+      `⚙️  Downloading node version for ${platform} using temporary patch.`,
+    );
+
+    // Check local cache.
+    let cached = false;
+    try {
+      const cachePath = path.join(homedir(), '.node', name);
+      await fs.access(cachePath, fs.constants.F_OK);
+      console.log(`⚙️  Cached artifact found, skip download.`);
+      nodePath = path.resolve(cachePath, 'bin', 'node');
+      cached = true;
+    } catch (err) {}
+    if (!cached) {
+      // Download node tarball from the distribution site.
+      await download(
+        `https://nodejs.org/dist/${NODE_VERSION}/${name}.tar.gz`,
+        downloadOutputPath,
+      );
+      // Finally, unpack the tarball to a local folder i.e. outputPath.
+      await unpack(downloadOutputPath, unpackedOutputPath);
+      console.log(`✅  Node successfully downloaded and unpacked.`);
+    }
+
+    console.log(`⚙️  Copying node binary from ${nodePath} to ${outputPath}`);
+    await fs.copyFile(nodePath, outputPath);
+  } else {
+    console.log(`⚙️  Downloading node version for ${platform} using pkg-fetch`);
+    const nodePath = await pkgFetch({
+      arch: nodeArchFromBuildPlatform(platform),
+      platform: nodePlatformFromBuildPlatform(platform),
+      nodeRange: SUPPORTED_NODE_PLATFORM,
+    });
+
+    console.log(`⚙️  Copying node binary from ${nodePath} to ${outputPath}`);
+    await fs.copyFile(nodePath, outputPath);
+  }
+
   // Set +x on the binary as copyFile doesn't maintain the bit.
   await fs.chmod(outputPath, 0o755);
+}
+
+async function setUpLinuxBundle(outputDir: string) {
+  console.log(`⚙️  Creating Linux startup script in ${outputDir}/flipper`);
+  await fs.writeFile(path.join(outputDir, 'flipper'), LINUX_STARTUP_SCRIPT);
+  // Give the script +x
+  await fs.chmod(path.join(outputDir, 'flipper'), 0o755);
 }
 
 async function setUpMacBundle(
@@ -523,8 +666,13 @@ async function bundleServerReleaseForPlatform(
 
   // On the mac, we need to set up a resource bundle which expects paths
   // to be in different places from Linux/Windows bundles.
-  if (platform === BuildPlatform.MAC_X64) {
+  if (
+    platform === BuildPlatform.MAC_X64 ||
+    platform === BuildPlatform.MAC_AARCH64
+  ) {
     outputPaths = await setUpMacBundle(outputDir, versionNumber);
+  } else if (platform === BuildPlatform.LINUX) {
+    await setUpLinuxBundle(outputDir);
   }
 
   console.log(`⚙️  Copying from ${dir} to ${outputPaths.resourcesPath}`);

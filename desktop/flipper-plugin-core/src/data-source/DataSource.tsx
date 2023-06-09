@@ -83,6 +83,11 @@ type OutputChange =
       // like: clear, filter or sorting change, etc
       type: 'reset';
       newCount: number;
+    }
+  | {
+      type: 'windowChange';
+      newStart: number;
+      newEnd: number;
     };
 
 export type DataSourceOptionKey<K extends PropertyKey> = {
@@ -232,7 +237,7 @@ export class DataSource<T extends any, KeyType = never> {
       if (this._recordsById.has(key)) {
         const existingValue = this._recordsById.get(key);
         console.warn(
-          `Tried to append value with duplicate key: ${key} (key attribute is ${this.keyAttribute}). Old/new values:`,
+          `Tried to append value with duplicate key: ${key} (key attribute is ${this.keyAttribute.toString()}). Old/new values:`,
           existingValue,
           value,
         );
@@ -579,9 +584,18 @@ export class DataSourceView<T, KeyType> {
     }
   }
 
+  getViewIndex(entry: T): number {
+    return this._output.findIndex((x) => x.value === entry);
+  }
+
   public setWindow(start: number, end: number) {
     this.windowStart = start;
     this.windowEnd = end;
+    this.notifyAllListeners({
+      type: 'windowChange',
+      newStart: start,
+      newEnd: end,
+    });
   }
 
   public addListener(listener: (change: OutputChange) => void) {

@@ -126,17 +126,19 @@ export default abstract class AbstractClient extends EventEmitter {
 
   // get the supported plugins
   protected async loadPlugins(_phase: 'init' | 'refresh'): Promise<Plugins> {
-    const {plugins} = await timeout(
-      30 * 1000,
-      this.rawCall<{plugins: Plugins}>('getPlugins', false),
-      'Fetch plugin timeout',
-    ).catch((e) => {
-      console.warn('Fetch plugin timeout for ' + this.id);
-      throw e;
-    });
-    this.plugins = new Set(plugins);
-    console.info('AbstractClient.loadPlugins', this.query, plugins);
-    return plugins;
+    let response;
+    try {
+      response = await timeout(
+        30 * 1000,
+        this.rawCall<{plugins: Plugins}>('getPlugins', false),
+        'Fetch plugin timeout. Unresponsive client?',
+      );
+    } catch (e) {
+      console.warn('[conn] Fetch plugin error', e);
+    }
+    this.plugins = new Set(response?.plugins ?? []);
+    console.info('AbstractClient.loadPlugins', this.query, [...this.plugins]);
+    return this.plugins;
   }
 
   protected loadPlugin(
@@ -228,6 +230,9 @@ export default abstract class AbstractClient extends EventEmitter {
     // diff the background plugin list, disconnect old, connect new ones
     oldBackgroundPlugins.forEach((plugin) => {
       if (!this.backgroundPlugins.has(plugin)) {
+        if (plugin === 'Msys') {
+          console.log('AbstyractClient.refreshPlugins -> deinit Msys');
+        }
         this.deinitPlugin(plugin);
       }
     });
@@ -354,6 +359,9 @@ export default abstract class AbstractClient extends EventEmitter {
 
       const plugin = params ? params.api : undefined;
 
+      const baseErrorMessage = `Unable to send ${params?.method ?? method} to ${
+        params?.api ?? 'FlipperCore'
+      }`;
       console.debug(data, 'message:call');
 
       const mark = this.getPerformanceMark(metadata);
@@ -388,12 +396,12 @@ export default abstract class AbstractClient extends EventEmitter {
             });
           }
         } catch (error) {
-          reject(new Error('Unable to send, connection error: ' + error));
+          reject(new Error(`${baseErrorMessage}, connection error: ${error}`));
         }
       } else {
         reject(
           new Error(
-            `Cannot send ${method}, client is not accepting messages for plugin ${plugin}`,
+            `${baseErrorMessage}, client is not accepting messages for plugin ${plugin}`,
           ),
         );
       }
